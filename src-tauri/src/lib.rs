@@ -1,9 +1,11 @@
+use chrono::Local;
 use serde::{Deserialize, Serialize};
-use sysinfo::{Disks, System, Signal};
-use std::sync::Mutex;
 use std::fs;
 use std::path::PathBuf;
-use chrono::Local;
+use std::sync::Mutex;
+use sysinfo::{Disks, System};
+
+mod gpu; // Import GPU module
 
 // ============= Data Structures =============
 
@@ -13,6 +15,7 @@ pub struct ProcRow {
     name: String,
     cpu: f32,
     memory_kb: u64,
+    gpu: f32, // Added GPU usage
 }
 
 #[derive(Serialize, Clone)]
@@ -22,6 +25,7 @@ pub struct ProcessGroup {
     pids: Vec<u32>,
     total_cpu: f32,
     total_memory_kb: u64,
+    total_gpu: f32, // Added GPU
 }
 
 #[derive(Serialize)]
@@ -47,23 +51,33 @@ pub struct DiskInfo {
 pub struct BlacklistEntry {
     pub name: String,
     pub auto_kill: bool,
-    pub cpu_threshold: f32,  // Kill only when CPU > this value (0 = always kill)
+    pub cpu_threshold: f32, // Kill only when CPU > this value (0 = always kill)
+    #[serde(default = "default_hundred")]
+    pub gpu_threshold: f32, // Kill when GPU > this value (101 = disabled, 0 = always)
     #[serde(default = "default_true")]
     pub log_enabled: bool,
+    #[serde(default)]
+    pub log_kills_only: bool,
     pub created_at: String,
     pub kill_count: u32,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
+fn default_hundred() -> f32 {
+    101.0
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ActivityLog {
     pub name: String,
     pub pid: u32,
     pub cpu_usage: f32,
+    pub gpu_usage: f32, // Added
     pub detected_at: String,
     pub was_killed: bool,
-    pub reason: String,  // "CPU threshold exceeded" or "Detected"
+    pub reason: String,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -147,7 +161,11 @@ fn get_system_stats() -> SystemStats {
                 total_gb: total as f64 / 1024.0 / 1024.0 / 1024.0,
                 used_gb: used as f64 / 1024.0 / 1024.0 / 1024.0,
                 free_gb: free as f64 / 1024.0 / 1024.0 / 1024.0,
-                usage_percent: if total > 0 { (used as f32 / total as f32) * 100.0 } else { 0.0 },
+                usage_percent: if total > 0 {
+                    (used as f32 / total as f32) * 100.0
+                } else {
+                    0.0
+                },
             }
         })
         .collect();
@@ -177,9 +195,12 @@ fn watched_processes(names: Vec<String>) -> Vec<ProcRow> {
 
     let mut sys = System::new_all();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    
+
     let cpu_count = sys.cpus().len() as f32;
     let cpu_count = if cpu_count > 0.0 { cpu_count } else { 1.0 };
+
+    // Fetch GPU usage
+    let gpu_usages = gpu::get_gpu_usages();
 
     sys.processes()
         .iter()
@@ -187,11 +208,13 @@ fn watched_processes(names: Vec<String>) -> Vec<ProcRow> {
             let pname = p.name().to_string_lossy().to_lowercase();
             if watch.iter().any(|w| pname.contains(w) || w == &pname) {
                 let normalized_cpu = p.cpu_usage() / cpu_count;
+                let gpu = *gpu_usages.get(&pid.as_u32()).unwrap_or(&0.0);
                 Some(ProcRow {
                     pid: pid.as_u32(),
                     name: p.name().to_string_lossy().to_string(),
                     cpu: normalized_cpu,
                     memory_kb: p.memory() / 1024,
+                    gpu,
                 })
             } else {
                 None
@@ -207,13 +230,22 @@ fn kill_pid(pid: u32) -> Result<String, String> {
 
     let pid = sysinfo::Pid::from_u32(pid);
     let process = sys.process(pid).ok_or("Process not found")?;
+    let process_name = process.name().to_string_lossy().to_string();
 
-    let ok = process.kill_with(Signal::Term).unwrap_or(false) || process.kill();
+    // On Windows, Signal::Term is not supported - use kill() directly which sends SIGKILL
+    let ok = process.kill();
 
     if ok {
-        Ok(format!("PID {} terminated", pid.as_u32()))
+        Ok(format!(
+            "PID {} ({}) terminated",
+            pid.as_u32(),
+            process_name
+        ))
     } else {
-        Err("Failed to kill (permission denied?)".into())
+        Err(format!(
+            "Failed to kill {} - requires Administrator privileges",
+            process_name
+        ))
     }
 }
 
@@ -222,15 +254,16 @@ fn kill_pid(pid: u32) -> Result<String, String> {
 fn kill_process_group(name: String) -> Result<String, String> {
     let mut sys = System::new_all();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    
+
     let name_lower = name.to_lowercase();
     let mut killed_count = 0;
     let mut failed_count = 0;
-    
-    for (pid, p) in sys.processes().iter() {
+
+    for (_pid, p) in sys.processes().iter() {
         let pname = p.name().to_string_lossy().to_lowercase();
         if pname.contains(&name_lower) || pname == name_lower {
-            let ok = p.kill_with(Signal::Term).unwrap_or(false) || p.kill();
+            // On Windows, use kill() directly instead of Signal::Term
+            let ok = p.kill();
             if ok {
                 killed_count += 1;
             } else {
@@ -238,21 +271,72 @@ fn kill_process_group(name: String) -> Result<String, String> {
             }
         }
     }
-    
+
     if killed_count > 0 {
-        Ok(format!("Killed {} processes, {} failed", killed_count, failed_count))
+        Ok(format!(
+            "Killed {} processes, {} failed",
+            killed_count, failed_count
+        ))
     } else if failed_count > 0 {
-        Err(format!("Failed to kill {} processes (permission denied?)", failed_count))
+        Err(format!(
+            "Failed to kill {} processes (permission denied?)",
+            failed_count
+        ))
     } else {
         Err("No matching processes found".into())
     }
+}
+
+/// Get ALL running processes grouped by name (for browse modal)
+#[tauri::command]
+fn get_all_process_list() -> Vec<ProcessGroup> {
+    use std::collections::HashMap;
+
+    let mut sys = System::new_all();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+    // Get CPU count for normalization
+    let cpu_count = sys.cpus().len() as f32;
+    let cpu_count = if cpu_count > 0.0 { cpu_count } else { 1.0 };
+
+    let mut groups: HashMap<String, ProcessGroup> = HashMap::new();
+
+    // Fetch GPU usage
+    let gpu_usages = gpu::get_gpu_usages();
+
+    for (pid, p) in sys.processes() {
+        let name = p.name().to_string_lossy().to_string();
+        let cpu = p.cpu_usage() / cpu_count;
+        let memory = p.memory();
+        let gpu = *gpu_usages.get(&pid.as_u32()).unwrap_or(&0.0);
+
+        let entry = groups.entry(name.clone()).or_insert(ProcessGroup {
+            name: name,
+            process_count: 0,
+            pids: Vec::new(),
+            total_cpu: 0.0,
+            total_memory_kb: 0,
+            total_gpu: 0.0,
+        });
+
+        entry.process_count += 1;
+        entry.pids.push(pid.as_u32());
+        entry.total_cpu += cpu;
+        entry.total_memory_kb += memory;
+        entry.total_gpu += gpu;
+    }
+
+    let mut result: Vec<ProcessGroup> = groups.into_values().collect();
+    // Sort by name alphabetically
+    result.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    result
 }
 
 /// Get processes grouped by name (like Task Manager)
 #[tauri::command]
 fn grouped_processes(names: Vec<String>) -> Vec<ProcessGroup> {
     use std::collections::HashMap;
-    
+
     let watch: Vec<String> = names
         .into_iter()
         .map(|s| resolve_process_name(&s))
@@ -265,42 +349,55 @@ fn grouped_processes(names: Vec<String>) -> Vec<ProcessGroup> {
 
     let mut sys = System::new_all();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    
+
     let cpu_count = sys.cpus().len() as f32;
     let cpu_count = if cpu_count > 0.0 { cpu_count } else { 1.0 };
-    
+
     // Group processes by base name (without .exe)
     let mut groups: HashMap<String, ProcessGroup> = HashMap::new();
-    
+
+    // Fetch GPU usage
+    let gpu_usages = gpu::get_gpu_usages();
+
     for (pid, p) in sys.processes().iter() {
         let pname = p.name().to_string_lossy().to_string();
         let pname_lower = pname.to_lowercase();
-        
-        if watch.iter().any(|w| pname_lower.contains(w) || w == &pname_lower) {
+
+        if watch
+            .iter()
+            .any(|w| pname_lower.contains(w) || w == &pname_lower)
+        {
             let normalized_cpu = p.cpu_usage() / cpu_count;
             let memory_kb = p.memory() / 1024;
-            
+            let gpu = *gpu_usages.get(&pid.as_u32()).unwrap_or(&0.0);
+
             // Use the original name as key (preserves case)
             let base_name = pname.clone();
-            
+
             let group = groups.entry(base_name.clone()).or_insert(ProcessGroup {
                 name: base_name,
                 process_count: 0,
                 pids: vec![],
                 total_cpu: 0.0,
                 total_memory_kb: 0,
+                total_gpu: 0.0,
             });
-            
+
             group.process_count += 1;
             group.pids.push(pid.as_u32());
             group.total_cpu += normalized_cpu;
             group.total_memory_kb += memory_kb;
+            group.total_gpu += gpu;
         }
     }
-    
+
     // Convert to vec and sort by CPU usage (highest first)
     let mut result: Vec<ProcessGroup> = groups.into_values().collect();
-    result.sort_by(|a, b| b.total_cpu.partial_cmp(&a.total_cpu).unwrap_or(std::cmp::Ordering::Equal));
+    result.sort_by(|a, b| {
+        b.total_cpu
+            .partial_cmp(&a.total_cpu)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     result
 }
 
@@ -319,7 +416,11 @@ fn add_to_blacklist(name: String, auto_kill: bool, cpu_threshold: f32) -> Result
     }
 
     with_state(|state| {
-        if state.blacklist.iter().any(|e| e.name.to_lowercase() == name.to_lowercase()) {
+        if state
+            .blacklist
+            .iter()
+            .any(|e| e.name.to_lowercase() == name.to_lowercase())
+        {
             return Err("Already in blacklist".into());
         }
 
@@ -327,7 +428,9 @@ fn add_to_blacklist(name: String, auto_kill: bool, cpu_threshold: f32) -> Result
             name: name.clone(),
             auto_kill,
             cpu_threshold,
+            gpu_threshold: 101.0, // Default to disabled
             log_enabled: true,
+            log_kills_only: false,
             created_at: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             kill_count: 0,
         });
@@ -339,7 +442,9 @@ fn add_to_blacklist(name: String, auto_kill: bool, cpu_threshold: f32) -> Result
 fn remove_from_blacklist(name: String) -> Result<String, String> {
     with_state(|state| {
         let len_before = state.blacklist.len();
-        state.blacklist.retain(|e| e.name.to_lowercase() != name.to_lowercase());
+        state
+            .blacklist
+            .retain(|e| e.name.to_lowercase() != name.to_lowercase());
         if state.blacklist.len() < len_before {
             Ok(format!("{} removed from blacklist", name))
         } else {
@@ -375,12 +480,39 @@ fn toggle_blacklist_log(name: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
+fn toggle_log_kills_only(name: String) -> Result<bool, String> {
+    with_state(|state| {
+        for entry in state.blacklist.iter_mut() {
+            if entry.name.to_lowercase() == name.to_lowercase() {
+                entry.log_kills_only = !entry.log_kills_only;
+                return Ok(entry.log_kills_only);
+            }
+        }
+        Err("Not found in blacklist".into())
+    })
+}
+
+#[tauri::command]
 fn set_cpu_threshold(name: String, threshold: f32) -> Result<f32, String> {
     with_state(|state| {
         for entry in state.blacklist.iter_mut() {
             if entry.name.to_lowercase() == name.to_lowercase() {
-                entry.cpu_threshold = threshold.max(0.0).min(100.0);
+                entry.cpu_threshold = threshold.max(0.0).min(101.0);
                 return Ok(entry.cpu_threshold);
+            }
+        }
+        Err("Not found in blacklist".into())
+    })
+}
+
+#[tauri::command]
+fn set_gpu_threshold(name: String, threshold: f32) -> Result<f32, String> {
+    with_state(|state| {
+        for entry in state.blacklist.iter_mut() {
+            if entry.name.to_lowercase() == name.to_lowercase() {
+                // 101.0 means disabled
+                entry.gpu_threshold = threshold.max(0.0).min(101.0);
+                return Ok(entry.gpu_threshold);
             }
         }
         Err("Not found in blacklist".into())
@@ -410,40 +542,84 @@ fn clear_activity_logs() -> String {
 fn check_and_kill_blacklist() -> Vec<ActivityLog> {
     let mut sys = System::new_all();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    
+
     // Get CPU count for normalization
     let cpu_count = sys.cpus().len() as f32;
     let cpu_count = if cpu_count > 0.0 { cpu_count } else { 1.0 };
 
+    // Fetch GPU usage
+    let gpu_usages = gpu::get_gpu_usages();
+
     let mut new_logs: Vec<ActivityLog> = vec![];
 
     with_state(|state| {
-        let blacklist_info: Vec<(String, bool, f32, bool)> = state.blacklist.iter()
-            .map(|e| (e.name.to_lowercase(), e.auto_kill, e.cpu_threshold, e.log_enabled))
+        let blacklist_info: Vec<(String, bool, f32, f32, bool, bool)> = state
+            .blacklist
+            .iter()
+            .map(|e| {
+                (
+                    e.name.to_lowercase(),
+                    e.auto_kill,
+                    e.cpu_threshold,
+                    e.gpu_threshold,
+                    e.log_enabled,
+                    e.log_kills_only,
+                )
+            })
             .collect();
 
         for (pid, p) in sys.processes().iter() {
             let pname = p.name().to_string_lossy().to_lowercase();
-            let process_cpu = p.cpu_usage() / cpu_count;  // Normalized CPU
+            let process_cpu = p.cpu_usage() / cpu_count; // Normalized CPU
+            let process_gpu = *gpu_usages.get(&pid.as_u32()).unwrap_or(&0.0);
 
-            for (bl_name, auto_kill, cpu_threshold, log_enabled) in &blacklist_info {
+            for (bl_name, auto_kill, cpu_threshold, gpu_threshold, log_enabled, log_kills_only) in
+                &blacklist_info
+            {
                 if pname.contains(bl_name) || bl_name == &pname {
                     // Check if CPU exceeds threshold (0 = always kill)
-                    let should_kill = *auto_kill && (*cpu_threshold <= 0.0 || process_cpu >= *cpu_threshold);
-                    
+                    let check_cpu = *cpu_threshold <= 0.0 || process_cpu >= *cpu_threshold;
+                    // Check if GPU exceeds threshold (default 101.0 = disabled)
+                    let check_gpu = *gpu_threshold <= 100.0 && process_gpu >= *gpu_threshold;
+
+                    let should_kill = *auto_kill && (check_cpu || check_gpu);
+
                     let (was_killed, reason) = if should_kill {
-                        let killed = p.kill_with(Signal::Term).unwrap_or(false) || p.kill();
+                        // On Windows, use kill() directly instead of Signal::Term
+                        let killed = p.kill();
                         if killed {
-                            if let Some(entry) = state.blacklist.iter_mut()
-                                .find(|e| e.name.to_lowercase() == *bl_name) {
+                            if let Some(entry) = state
+                                .blacklist
+                                .iter_mut()
+                                .find(|e| e.name.to_lowercase() == *bl_name)
+                            {
                                 entry.kill_count += 1;
                             }
-                            (true, format!("Killed (CPU: {:.1}%)", process_cpu))
+                            let reason_str = if check_cpu && check_gpu {
+                                format!(
+                                    "Killed (CPU: {:.1}%, GPU: {:.1}%)",
+                                    process_cpu, process_gpu
+                                )
+                            } else if check_gpu {
+                                format!("Killed (GPU: {:.1}%)", process_gpu)
+                            } else {
+                                format!("Killed (CPU: {:.1}%)", process_cpu)
+                            };
+                            (true, reason_str)
                         } else {
-                            (false, "Kill failed (no permission)".to_string())
+                            (
+                                false,
+                                format!(
+                                    "Kill failed - requires Admin (CPU: {:.1}%, GPU: {:.1}%)",
+                                    process_cpu, process_gpu
+                                ),
+                            )
                         }
-                    } else if *auto_kill && process_cpu < *cpu_threshold {
-                        (false, format!("CPU {:.1}% < threshold {:.0}%", process_cpu, cpu_threshold))
+                    } else if *auto_kill {
+                        (
+                            false,
+                            format!("Safe (CPU: {:.1}%, GPU: {:.1}%)", process_cpu, process_gpu),
+                        )
                     } else {
                         (false, "Detected".to_string())
                     };
@@ -452,12 +628,16 @@ fn check_and_kill_blacklist() -> Vec<ActivityLog> {
                         name: p.name().to_string_lossy().to_string(),
                         pid: pid.as_u32(),
                         cpu_usage: process_cpu,
+                        gpu_usage: process_gpu,
                         detected_at: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                         was_killed,
                         reason,
                     };
 
-                    if *log_enabled {
+                    // Only log if logging is enabled AND (log_kills_only is false OR was_killed is true)
+                    let should_log = *log_enabled && (!*log_kills_only || was_killed);
+
+                    if should_log {
                         new_logs.push(log.clone());
                         state.activity_logs.push(log);
                     }
@@ -468,7 +648,9 @@ fn check_and_kill_blacklist() -> Vec<ActivityLog> {
 
         // Keep only last 1000 logs
         if state.activity_logs.len() > 1000 {
-            state.activity_logs = state.activity_logs.split_off(state.activity_logs.len() - 1000);
+            state.activity_logs = state
+                .activity_logs
+                .split_off(state.activity_logs.len() - 1000);
         }
     });
 
@@ -490,6 +672,75 @@ fn resolve_process_name(input: &str) -> String {
     }
 }
 
+// ============= Admin Check =============
+
+#[tauri::command]
+fn is_running_as_admin() -> bool {
+    #[cfg(windows)]
+    {
+        use std::mem;
+        use std::ptr;
+
+        type HANDLE = *mut std::ffi::c_void;
+        type BOOL = i32;
+        type DWORD = u32;
+
+        #[repr(C)]
+        struct TOKEN_ELEVATION {
+            token_is_elevated: DWORD,
+        }
+
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn OpenProcessToken(
+                ProcessHandle: HANDLE,
+                DesiredAccess: DWORD,
+                TokenHandle: *mut HANDLE,
+            ) -> BOOL;
+            fn GetTokenInformation(
+                TokenHandle: HANDLE,
+                TokenInformationClass: u32,
+                TokenInformation: *mut std::ffi::c_void,
+                TokenInformationLength: DWORD,
+                ReturnLength: *mut DWORD,
+            ) -> BOOL;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentProcess() -> HANDLE;
+            fn CloseHandle(hObject: HANDLE) -> BOOL;
+        }
+
+        const TOKEN_QUERY: DWORD = 0x0008;
+        const TOKEN_ELEVATION_TYPE: u32 = 20;
+
+        unsafe {
+            let mut token: HANDLE = ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return false;
+            }
+
+            let mut elevation: TOKEN_ELEVATION = mem::zeroed();
+            let mut return_length: DWORD = 0;
+
+            let result = GetTokenInformation(
+                token,
+                TOKEN_ELEVATION_TYPE,
+                &mut elevation as *mut _ as *mut _,
+                mem::size_of::<TOKEN_ELEVATION>() as DWORD,
+                &mut return_length,
+            );
+
+            CloseHandle(token);
+            result != 0 && elevation.token_is_elevated != 0
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 // ============= App Entry =============
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -499,6 +750,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             watched_processes,
             grouped_processes,
+            get_all_process_list,
             kill_pid,
             kill_process_group,
             get_system_stats,
@@ -507,10 +759,13 @@ pub fn run() {
             remove_from_blacklist,
             toggle_auto_kill,
             toggle_blacklist_log,
+            toggle_log_kills_only,
             set_cpu_threshold,
+            set_gpu_threshold,
             get_activity_logs,
             clear_activity_logs,
-            check_and_kill_blacklist
+            check_and_kill_blacklist,
+            is_running_as_admin
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
