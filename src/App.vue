@@ -85,7 +85,8 @@ const newGpuThreshold = ref(50); // Default 50%
 const blacklistStatus = ref("");
 const isAdmin = ref(false);
 
-let timer: ReturnType<typeof setInterval> | undefined;
+let uiTimer: ReturnType<typeof setInterval> | undefined;
+let killTimer: ReturnType<typeof setInterval> | undefined;
 
 // ============= Sorting =============
 
@@ -369,12 +370,12 @@ async function checkBlacklist() {
 
 // ============= Lifecycle =============
 
-async function refreshAll() {
-  await Promise.all([
-    refreshProcesses(),
-    refreshSystemStats(),
-    checkBlacklist(),
-  ]);
+async function refreshUI() {
+  await Promise.all([refreshProcesses(), refreshSystemStats()]);
+}
+
+async function refreshKillCheck() {
+  await checkBlacklist();
 }
 
 onMounted(async () => {
@@ -387,12 +388,15 @@ onMounted(async () => {
 
   await refreshBlacklist();
   await refreshActivityLogs();
-  await refreshAll();
-  timer = setInterval(refreshAll, 1000);
+  await refreshUI();
+  await refreshKillCheck();
+  uiTimer = setInterval(refreshUI, 2000);
+  killTimer = setInterval(refreshKillCheck, 5000);
 });
 
 onBeforeUnmount(() => {
-  if (timer) clearInterval(timer);
+  if (uiTimer) clearInterval(uiTimer);
+  if (killTimer) clearInterval(killTimer);
 });
 
 function getUsageColor(percent: number): string {
